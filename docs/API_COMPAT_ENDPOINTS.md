@@ -3,13 +3,13 @@
 **Author:** Brad Hill (Bren School, UCSB)
 **Date:** March 2026
 **For:** Yaheya / LLM Sandbox Architecture Team
-**Reference implementation:** [bhill00/bedrock-chat](https://github.com/bhill00/bedrock-chat/tree/v3) (fork of aws-samples/bedrock-chat with working endpoint)
+**Reference implementation:** [bhill00/bedrock-chat](https://github.com/bhill00/bedrock-chat/tree/v3) (fork of aws-samples/bedrock-chat with working endpoints)
 
 ---
 
 ## Summary
 
-This document describes how to add an OpenAI-compatible `/v1/chat/completions` endpoint to the existing Bedrock Chat stack. The endpoint extends the **Published Bot API** infrastructure so that every published bot automatically gains a standard API endpoint alongside the existing `/conversation` endpoint. Same API key, same bot, same compliance controls — different payload format.
+This document describes how to add OpenAI and Anthropic compatible API endpoints to the existing Bedrock Chat stack. The endpoints extend the **Published Bot API** infrastructure so that every published bot automatically gains standard API endpoints alongside the existing `/conversation` endpoint. Same API key, same bot, same compliance controls — different payload format.
 
 The implementation was built and tested on a personal AWS deployment of the upstream [aws-samples/bedrock-chat](https://github.com/aws-samples/bedrock-chat) v3. The UCSB LLM Sandbox is a modified fork with NIST 800-171 compliance enhancements. The code examples and file references below are based on the upstream project — function names and file paths may differ in the Sandbox fork, but the architectural approach applies directly.
 
@@ -41,6 +41,7 @@ Published Bot (existing)
 ├── POST /conversation          ← existing async Bot API (unchanged)
 ├── GET  /conversation/{id}     ← existing poll endpoint (unchanged)
 ├── POST /v1/chat/completions   ← NEW: OpenAI-compatible (sync + streaming)
+├── POST /v1/messages           ← NEW: Anthropic-compatible (sync + streaming)
 └── GET  /v1/models             ← NEW: list available models
 ```
 
@@ -136,6 +137,20 @@ def build_generation_params(req, bot_params=None):
 - `metadata` → captures `inputTokens`/`outputTokens`
 - `messageStop` → `{"finish_reason": "stop", "usage": {...}}`
 
+**Anthropic endpoint** (`/v1/messages`) — Same file, same pattern. Key differences from OpenAI:
+
+| | OpenAI `/v1/chat/completions` | Anthropic `/v1/messages` |
+|---|---|---|
+| System prompt | In `messages[]` with `role: "system"` | Separate `system` field |
+| `max_tokens` | Optional (defaults to 4096) | Required |
+| `top_k` | Extension (not in OpenAI spec) | Native parameter |
+| `stop` param | `stop` (string or array) | `stop_sequences` (array) |
+| Response body | `choices[0].message.content` (string) | `content[]` (array of `{type, text}` blocks) |
+| Streaming format | `data: {"choices":[{"delta":{"content":"..."}}]}` | `event: content_block_delta\ndata: {"delta":{"text":"..."}}` |
+| Usage field | `usage.prompt_tokens` / `completion_tokens` | `usage.input_tokens` / `output_tokens` |
+
+The Anthropic endpoint enables tools that use the Anthropic SDK (Claude Code, some LangChain configs) to connect directly.
+
 ### 3. `backend/app/main.py` (modified, 5 lines)
 
 ```python
@@ -214,6 +229,22 @@ curl https://<api-url>/api/v1/chat/completions \
   -d '{"model":"claude-v4-sonnet","messages":[{"role":"user","content":"Hello!"}],"stream":true,"temperature":0.2}'
 ```
 
+### Anthropic format (`/v1/messages`)
+
+```bash
+# Non-streaming
+curl https://<api-url>/api/v1/messages \
+  -H "x-api-key: <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-v4-sonnet","system":"You are helpful.","messages":[{"role":"user","content":"Hello!"}],"max_tokens":1024}'
+
+# Streaming
+curl https://<api-url>/api/v1/messages \
+  -H "x-api-key: <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-v4-sonnet","messages":[{"role":"user","content":"Hello!"}],"max_tokens":1024,"stream":true}'
+```
+
 ### Client SDK examples
 
 ```python
@@ -226,9 +257,30 @@ response = client.chat.completions.create(
     temperature=0.2,
 )
 
-# LangChain
+# Anthropic SDK
+from anthropic import Anthropic
+client = Anthropic(
+    base_url="https://<api-url>/api/v1",
+    api_key="<key>",
+)
+message = client.messages.create(
+    model="claude-v4-sonnet",
+    max_tokens=1024,
+    system="You are a helpful assistant.",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+
+# LangChain (OpenAI)
 from langchain_openai import ChatOpenAI
 llm = ChatOpenAI(
+    base_url="https://<api-url>/api/v1",
+    api_key="<key>",
+    model="claude-v4-sonnet",
+)
+
+# LangChain (Anthropic)
+from langchain_anthropic import ChatAnthropic
+llm = ChatAnthropic(
     base_url="https://<api-url>/api/v1",
     api_key="<key>",
     model="claude-v4-sonnet",
@@ -241,8 +293,7 @@ llm = ChatOpenAI(
 
 - **Structured function calling** (`tools` array) — Would require mapping OpenAI's tool_calls protocol to Bedrock's tool use format. Prompt-engineered tool use works fine.
 - **Embeddings** (`/v1/embeddings`) — Bedrock has embedding models but they use a different API. Could be added separately.
-- **Conversation persistence** — The OpenAI endpoint is stateless by design. Each request is independent. The existing `/conversation` endpoint still handles persistent conversations.
-- **Anthropic native endpoint** (`/v1/messages`) — Could be added with similar approach. The streaming format differs (Anthropic SSE event types vs OpenAI chunks).
+- **Conversation persistence** — Both endpoints are stateless by design. Each request is independent. The existing `/conversation` endpoint still handles persistent conversations.
 
 ---
 
