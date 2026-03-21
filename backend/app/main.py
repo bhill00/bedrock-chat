@@ -16,6 +16,7 @@ from app.routes.bot_store import router as bot_store_router
 from app.routes.conversation import router as conversation_router
 from app.routes.global_config import router as global_config_router
 from app.routes.published_api import router as published_api_router
+from app.routes.openai_compat import router as openai_compat_router
 from app.routes.user import router as user_router
 from app.user import User
 from app.utils import is_running_on_lambda
@@ -46,6 +47,7 @@ if not is_published_api:
         {"name": "user", "description": "User API (cognito)"},
         {"name": "bot_store", "description": "Bot Store API"},
         {"name": "config", "description": "Global Configuration API"},
+        {"name": "openai_compat", "description": "OpenAI-compatible API"},
     ]
     title = "Bedrock Chat"
 else:
@@ -69,6 +71,9 @@ if not is_published_api:
     app.include_router(global_config_router)
 else:
     app.include_router(published_api_router)
+
+# OpenAI-compatible endpoint — available in both regular and published API modes
+app.include_router(openai_compat_router)
 
 
 app.add_middleware(
