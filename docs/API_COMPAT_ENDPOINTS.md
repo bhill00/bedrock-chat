@@ -13,7 +13,7 @@ This document describes how to add OpenAI and Anthropic compatible API endpoints
 
 The implementation was built and tested on a personal AWS deployment of the upstream [aws-samples/bedrock-chat](https://github.com/aws-samples/bedrock-chat) v3. The UCSB LLM Sandbox is a modified fork with NIST 800-171 compliance enhancements. The code examples and file references below are based on the upstream project — function names and file paths may differ in the Sandbox fork, but the architectural approach applies directly.
 
-**Total new code:** ~385 lines across 3 files, plus 5 lines modified in `main.py`.
+**Total new code:** ~500 lines across 3 files, plus 5 lines modified in `main.py`.
 
 ---
 
@@ -28,7 +28,7 @@ The current Bot API uses a custom async request/response format (POST → SQS �
 | No per-request inference parameters | temperature/max_tokens locked to bot settings; different use cases need separate bots |
 | Inaccurate token tracking | Proxy can't report real usage since Bot API doesn't expose it |
 
-A native OpenAI-compatible endpoint solves all of these while preserving the existing compliance controls.
+Native OpenAI and Anthropic compatible endpoints solve all of these while preserving the existing compliance controls.
 
 ---
 
@@ -47,22 +47,22 @@ Published Bot (existing)
 
 Same API key authenticates all endpoints. The bot's configuration provides:
 
-| Bot Setting | OpenAI Endpoint Behavior |
+| Bot Setting | Endpoint Behavior |
 |---|---|
 | **Instruction (system prompt)** | Prepended to every request — always present, not overridable |
 | **Guardrails** | Always applied — not overridable by the client |
 | **Generation params** (temp, max_tokens, top_p) | Used as defaults — client can override per-request |
 | **Model** | Client specifies per-request (with alias support) |
 
-**This preserves the compliance boundary.** Whatever NIST controls are enforced through the bot configuration (guardrails, system prompts, model restrictions, audit logging) carry over to the OpenAI endpoint automatically. The bot owner sets the safety rails; the API consumer gets the convenience of the OpenAI format with per-request tuning, but cannot bypass the guardrails.
+**This preserves the compliance boundary.** Whatever NIST controls are enforced through the bot configuration (guardrails, system prompts, model restrictions, audit logging) carry over to both endpoints automatically. The bot owner sets the safety rails; the API consumer gets the convenience of standard API formats with per-request tuning, but cannot bypass the guardrails.
 
 ---
 
 ## What Changed (3 new files, 1 modified)
 
-### 1. `backend/app/routes/schemas/openai_compat.py` (new, 26 lines)
+### 1. `backend/app/routes/schemas/openai_compat.py` (new, ~50 lines)
 
-Pydantic models for the OpenAI request format:
+Pydantic models for both API formats:
 
 ```python
 class OpenAIMessage(BaseModel):
@@ -87,7 +87,22 @@ class OpenAIChatCompletionRequest(BaseModel):
 
 Note: `top_k` is an Anthropic/Bedrock extension not present in the OpenAI spec. OpenAI only exposes `top_p`. Including it here means Anthropic SDK clients can use it, while OpenAI SDK clients simply ignore it.
 
-### 2. `backend/app/routes/openai_compat.py` (new, ~360 lines)
+```python
+# Anthropic /v1/messages schema
+class AnthropicMessagesRequest(BaseModel):
+    model: str
+    messages: list[AnthropicMessage]
+    system: Optional[str] = None           # Separate from messages (Anthropic convention)
+    max_tokens: int = 4096                 # Required in Anthropic API
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None            # Native Anthropic parameter
+    stream: Optional[bool] = False
+    stop_sequences: Optional[list[str]] = None
+    metadata: Optional[dict] = None
+```
+
+### 2. `backend/app/routes/openai_compat.py` (new, ~500 lines)
 
 The main endpoint. Key components:
 
@@ -178,7 +193,7 @@ The router is registered **unconditionally** — available in both the main app 
 | `get_bedrock_runtime_client()` | `utils.py:45` | Boto3 Bedrock client |
 | Request logging middleware | `main.py:138` | Audit trail — already captures all requests |
 
-The OpenAI endpoint introduces **zero new infrastructure** — no new DynamoDB tables, no new IAM roles, no new Lambda functions. It's additional routes on the existing FastAPI app.
+Both endpoints introduce **zero new infrastructure** — no new DynamoDB tables, no new IAM roles, no new Lambda functions. They're additional routes on the existing FastAPI app.
 
 ---
 
@@ -299,19 +314,19 @@ llm = ChatAnthropic(
 
 ## Compliance Preservation Summary
 
-| Control | Existing Bot API | OpenAI Endpoint | Notes |
+| Control | Existing Bot API | OpenAI + Anthropic Endpoints | Notes |
 |---|---|---|---|
 | API key auth | Yes | Yes | Same key, same mechanism |
 | Bot-level guardrails | Yes | Yes | Applied unconditionally |
 | Bot instruction/system prompt | Yes | Yes | Prepended to every request |
 | Request audit logging | Yes | Yes | Same middleware |
-| Token usage tracking | Via bot dashboard | Via response `usage` field + CloudWatch | From Bedrock InvocationMetrics |
+| Token usage tracking | Via bot dashboard | Via response `usage` field + CloudWatch | From Bedrock Converse API metrics |
 | Data isolation (VPC) | Yes | Yes | Same Lambda, same network |
 | Encryption in transit | TLS | TLS | Same API Gateway |
 | Per-bot access control | Yes | Yes | Same published API isolation |
 | Conversation persistence | Yes (DynamoDB) | No (stateless) | Privacy advantage for some use cases |
 
-The stateless nature of the OpenAI endpoint is actually a compliance feature — no conversation history is stored server-side, reducing the data retention surface.
+The stateless nature of both endpoints is actually a compliance feature — no conversation history is stored server-side, reducing the data retention surface.
 
 ---
 
@@ -321,11 +336,36 @@ All changes are on the `v3` branch of [bhill00/bedrock-chat](https://github.com/
 
 | File | Change | Purpose |
 |---|---|---|
-| `backend/app/routes/openai_compat.py` | New | OpenAI endpoint + streaming + bot integration |
-| `backend/app/routes/schemas/openai_compat.py` | New | Pydantic request/response models |
+| `backend/app/routes/openai_compat.py` | New | OpenAI + Anthropic endpoints, streaming, bot integration |
+| `backend/app/routes/schemas/openai_compat.py` | New | Pydantic models for both API formats |
 | `backend/app/main.py` | +5 lines | Router registration |
 | `frontend/package.json` | Modified | xstate-v4 npm alias (build fix) |
 | `frontend/vite.config.ts` | Modified | Vite plugin for xstate resolution (build fix) |
 | `frontend/package-lock.json` | Modified | Lockfile update |
 
 To see the exact diff: `git diff origin/v3..v3`
+
+---
+
+## Verified Test Results
+
+Tested on a live deployment (personal AWS account, March 2026):
+
+| Test | Endpoint | Result |
+|---|---|---|
+| Non-streaming, OpenAI format | `/v1/chat/completions` | "Hello there, friend!" — 22 tokens |
+| Streaming SSE, OpenAI format | `/v1/chat/completions` | Real token-by-token, pirate system prompt works |
+| Non-streaming, Anthropic format | `/v1/messages` | "Ahoy there, matey!" — 31 tokens, `content[]` blocks |
+| Streaming SSE, Anthropic format | `/v1/messages` | Typed events (message_start, content_block_delta, etc.) |
+| Per-request temperature | Both | 0.2 and 0.7 tested, override bot defaults |
+| System prompt (OpenAI) | `/v1/chat/completions` | Via `messages[]` with `role: "system"` |
+| System prompt (Anthropic) | `/v1/messages` | Via separate `system` field |
+| Model aliases | Both | `gpt-4` → `claude-v4.5-sonnet`, Anthropic names work |
+| Token usage (non-streaming) | Both | Accurate from Bedrock Converse API metrics |
+| Bot guardrails | Both | Applied from bot config, not overridable |
+| Bot instruction | Both | Prepended to system messages |
+| API key auth | Both | Same key as existing `/conversation` endpoint |
+
+### Standalone proxy (bedrock-api-proxy)
+
+The lightweight Lambda proxy ([bhill00/bedrock-api-proxy](https://github.com/bhill00/bedrock-api-proxy)) was the original proof of concept. It provides the same OpenAI + Anthropic endpoints without the Bedrock Chat infrastructure (no bots, no Cognito, no DynamoDB). Useful for direct Bedrock access with just an API key.
