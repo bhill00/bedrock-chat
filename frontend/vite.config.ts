@@ -12,8 +12,14 @@ function amplifyXstateFixPlugin(): Plugin {
     async resolveId(source, importer, options) {
       if (source !== 'xstate' || !importer) return null;
 
-      // Redirect xstate imports from @aws-amplify packages to xstate-v4
-      if (importer.includes('@aws-amplify') || importer.includes('@xstate')) {
+      // Redirect xstate imports from @aws-amplify packages (and their nested
+      // @xstate/react v3) to xstate-v4. Only match when @xstate appears AFTER
+      // @aws-amplify in the path (i.e., nested), not top-level @xstate/react.
+      const isAmplifyPackage = importer.includes('@aws-amplify');
+      const isNestedXstate =
+        importer.includes('@xstate') &&
+        importer.includes('@aws-amplify');
+      if (isAmplifyPackage || isNestedXstate) {
         const result = await this.resolve('xstate-v4', importer, {
           ...options,
           skipSelf: true,
