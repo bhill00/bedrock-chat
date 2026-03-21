@@ -312,6 +312,10 @@ async def stream_openai_response(
         input_tokens = 0
         output_tokens = 0
 
+        # Bedrock Converse API event order: contentBlockDelta* → messageStop → metadata
+        # We defer the final "stop" chunk until after metadata so token counts are accurate.
+        stop_received = False
+
         for event in response["stream"]:
             if "contentBlockDelta" in event:
                 delta = event["contentBlockDelta"]["delta"]
@@ -319,18 +323,22 @@ async def stream_openai_response(
                     text = delta["text"]
                     yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]})}\n\n"
 
+            elif "messageStop" in event:
+                stop_received = True
+
             elif "metadata" in event:
                 usage = event["metadata"].get("usage", {})
                 input_tokens = usage.get("inputTokens", 0)
                 output_tokens = usage.get("outputTokens", 0)
 
-            elif "messageStop" in event:
-                logger.info(
-                    "USAGE endpoint=openai_stream model=%s input_tokens=%d output_tokens=%d total_tokens=%d bot=%s",
-                    model_name, input_tokens, output_tokens, input_tokens + output_tokens,
-                    PUBLISHED_API_ID or "none",
-                )
-                yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': input_tokens, 'completion_tokens': output_tokens, 'total_tokens': input_tokens + output_tokens}})}\n\n"
+        # Emit final chunk with accurate token counts after all events processed
+        if stop_received:
+            logger.info(
+                "USAGE endpoint=openai_stream model=%s input_tokens=%d output_tokens=%d total_tokens=%d bot=%s",
+                model_name, input_tokens, output_tokens, input_tokens + output_tokens,
+                PUBLISHED_API_ID or "none",
+            )
+            yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': input_tokens, 'completion_tokens': output_tokens, 'total_tokens': input_tokens + output_tokens}})}\n\n"
 
     except Exception as e:
         logger.error(f"Streaming error: {e}")
