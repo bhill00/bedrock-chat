@@ -1,19 +1,25 @@
 """OpenAI-compatible /v1/chat/completions endpoint.
 
-Translates OpenAI API format to Bedrock Converse API calls using the existing
-bedrock-chat infrastructure. Supports streaming (SSE) and non-streaming modes,
-per-request inference parameters, and accurate token usage reporting.
+Designed to work with the Published Bot API infrastructure. When a bot is
+published, its API endpoint gains /v1/chat/completions alongside the existing
+/conversation endpoint. The bot's settings (instruction, model, guardrails,
+generation_params) serve as defaults, with per-request overrides for
+temperature, max_tokens, top_p, and stop sequences.
+
+In the main (non-published) app, the endpoint works without a bot context
+using only the parameters provided in the request.
 """
 
 import json
 import logging
+import os
 import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from app.bedrock import compose_args_for_converse_api, calculate_price
+from app.bedrock import compose_args_for_converse_api
 from app.repositories.models.conversation import (
     SimpleMessageModel,
     TextContentModel,
@@ -21,6 +27,7 @@ from app.repositories.models.conversation import (
 from app.repositories.models.custom_bot import GenerationParamsModel
 from app.routes.schemas.conversation import type_model_name
 from app.routes.schemas.openai_compat import OpenAIChatCompletionRequest
+from app.user import User
 from app.utils import get_bedrock_runtime_client
 
 logger = logging.getLogger(__name__)
@@ -28,8 +35,9 @@ logger.setLevel(logging.INFO)
 
 router = APIRouter(prefix="/v1", tags=["openai_compat"])
 
+PUBLISHED_API_ID = os.environ.get("PUBLISHED_API_ID", None)
+
 # Aliases: OpenAI/Anthropic model names → bedrock-chat type_model_name values.
-# Clients can use either the alias or the native name directly.
 MODEL_ALIASES: dict[str, str] = {
     # OpenAI drop-in aliases
     "gpt-4": "claude-v4.5-sonnet",
@@ -48,7 +56,6 @@ MODEL_ALIASES: dict[str, str] = {
     "us.anthropic.claude-haiku-4-5-20251001-v1:0": "claude-v4.5-haiku",
 }
 
-# All valid type_model_name values (duplicated here to validate without importing Literal)
 VALID_MODEL_NAMES = {
     "claude-v4-opus", "claude-v4.1-opus", "claude-v4.5-opus",
     "claude-v4-sonnet", "claude-v4.5-sonnet", "claude-v4.5-haiku",
@@ -76,14 +83,31 @@ def resolve_model(model: str) -> type_model_name:
     return resolved  # type: ignore
 
 
+def _get_bot_context() -> tuple:
+    """Load bot settings when running as a published API.
+
+    Returns (instruction, generation_params, guardrail) from the bot config.
+    If not in published API mode, returns (None, None, None).
+    """
+    if not PUBLISHED_API_ID:
+        return None, None, None
+
+    try:
+        from app.usecases.bot import fetch_bot
+
+        user = User.from_published_api_id(PUBLISHED_API_ID)
+        bot_id = user.id.split("#")[1] if "#" in user.id else user.id
+        _, bot = fetch_bot(user, bot_id)
+        return bot.instruction, bot.generation_params, bot.bedrock_guardrails
+    except Exception as e:
+        logger.warning(f"Failed to load bot context: {e}")
+        return None, None, None
+
+
 def openai_messages_to_simple(
     messages: list,
 ) -> tuple[list[str], list[SimpleMessageModel]]:
-    """Convert OpenAI messages array to (system_instructions, SimpleMessageModel list).
-
-    Separates system messages into instructions and converts user/assistant
-    messages to the SimpleMessageModel format that compose_args_for_converse_api expects.
-    """
+    """Convert OpenAI messages array to (system_instructions, SimpleMessageModel list)."""
     system_parts: list[str] = []
     simple_messages: list[SimpleMessageModel] = []
 
@@ -110,7 +134,6 @@ def openai_messages_to_simple(
                         content.append(
                             TextContentModel(content_type="text", body=block["text"])
                         )
-                    # TODO: image_url support could be added here
             else:
                 content = [TextContentModel(content_type="text", body=str(msg.content or ""))]
 
@@ -121,8 +144,29 @@ def openai_messages_to_simple(
     return system_parts, simple_messages
 
 
-def build_generation_params(req: OpenAIChatCompletionRequest) -> GenerationParamsModel:
-    """Build GenerationParamsModel from per-request OpenAI parameters."""
+def build_generation_params(
+    req: OpenAIChatCompletionRequest,
+    bot_params: GenerationParamsModel | None = None,
+) -> GenerationParamsModel:
+    """Build GenerationParamsModel with bot defaults + per-request overrides.
+
+    Bot settings provide the base. Per-request params override when explicitly set.
+    This lets the bot owner set safe defaults while the API consumer can tune
+    temperature/max_tokens for their specific use case.
+    """
+    if bot_params:
+        return GenerationParamsModel(
+            max_tokens=req.max_tokens if req.max_tokens is not None else bot_params.max_tokens,
+            temperature=req.temperature if req.temperature is not None else bot_params.temperature,
+            top_p=req.top_p if req.top_p is not None else bot_params.top_p,
+            top_k=req.top_k if req.top_k is not None else bot_params.top_k,
+            stop_sequences=(
+                ([req.stop] if isinstance(req.stop, str) else req.stop)
+                if req.stop is not None
+                else bot_params.stop_sequences
+            ),
+        )
+
     return GenerationParamsModel(
         max_tokens=req.max_tokens or 4096,
         temperature=req.temperature if req.temperature is not None else 1.0,
@@ -133,30 +177,52 @@ def build_generation_params(req: OpenAIChatCompletionRequest) -> GenerationParam
 
 
 # ---------------------------------------------------------------------------
-# Non-streaming endpoint
+# POST /v1/chat/completions
 # ---------------------------------------------------------------------------
 @router.post("/chat/completions")
 def chat_completions(request: Request, req: OpenAIChatCompletionRequest):
-    """OpenAI-compatible chat completions endpoint."""
+    """OpenAI-compatible chat completions endpoint.
+
+    When running as a Published Bot API:
+    - Bot's instruction is prepended to system messages
+    - Bot's generation_params serve as defaults (overridable per-request)
+    - Bot's guardrails are always applied (not overridable)
+
+    When running in the main app:
+    - Uses only the parameters provided in the request
+    - Requires Cognito JWT auth
+    """
     current_user = getattr(request.state, "current_user", None)
     model_name = resolve_model(req.model)
     request_id = uuid.uuid4().hex[:8]
 
+    # Load bot context (instruction, params, guardrails) if in published API mode
+    bot_instruction, bot_gen_params, bot_guardrail = _get_bot_context()
+
     if req.stream:
         return StreamingResponse(
-            stream_openai_response(req, model_name, request_id),
+            stream_openai_response(
+                req, model_name, request_id,
+                bot_instruction, bot_gen_params, bot_guardrail,
+            ),
             media_type="text/event-stream",
         )
 
-    # Non-streaming: invoke Bedrock and return full response
+    # Non-streaming
     instructions, messages = openai_messages_to_simple(req.messages)
-    generation_params = build_generation_params(req)
+
+    # Prepend bot instruction to system instructions
+    if bot_instruction:
+        instructions.insert(0, bot_instruction)
+
+    generation_params = build_generation_params(req, bot_gen_params)
 
     args = compose_args_for_converse_api(
         messages=messages,
         model=model_name,
         instructions=instructions,
         generation_params=generation_params,
+        guardrail=bot_guardrail,
         stream=False,
     )
 
@@ -178,9 +244,10 @@ def chat_completions(request: Request, req: OpenAIChatCompletionRequest):
     output_tokens = usage.get("outputTokens", 0)
 
     logger.info(
-        "USAGE endpoint=openai model=%s input_tokens=%d output_tokens=%d total_tokens=%d user=%s",
+        "USAGE endpoint=openai model=%s input_tokens=%d output_tokens=%d total_tokens=%d user=%s bot=%s",
         model_name, input_tokens, output_tokens, input_tokens + output_tokens,
         current_user.id if current_user else "anonymous",
+        PUBLISHED_API_ID or "none",
     )
 
     return {
@@ -204,25 +271,34 @@ def chat_completions(request: Request, req: OpenAIChatCompletionRequest):
 
 
 # ---------------------------------------------------------------------------
-# Streaming endpoint (SSE)
+# Streaming
 # ---------------------------------------------------------------------------
 async def stream_openai_response(
     req: OpenAIChatCompletionRequest,
     model_name: type_model_name,
     request_id: str,
+    bot_instruction: str | None = None,
+    bot_gen_params: GenerationParamsModel | None = None,
+    bot_guardrail=None,
 ):
     """Stream Bedrock Converse API response as OpenAI SSE chunks."""
     chunk_id = f"chatcmpl-{request_id}"
     created = int(time.time())
 
     instructions, messages = openai_messages_to_simple(req.messages)
-    generation_params = build_generation_params(req)
+
+    # Prepend bot instruction
+    if bot_instruction:
+        instructions.insert(0, bot_instruction)
+
+    generation_params = build_generation_params(req, bot_gen_params)
 
     args = compose_args_for_converse_api(
         messages=messages,
         model=model_name,
         instructions=instructions,
         generation_params=generation_params,
+        guardrail=bot_guardrail,
         stream=True,
     )
 
@@ -250,8 +326,9 @@ async def stream_openai_response(
 
             elif "messageStop" in event:
                 logger.info(
-                    "USAGE endpoint=openai_stream model=%s input_tokens=%d output_tokens=%d total_tokens=%d",
+                    "USAGE endpoint=openai_stream model=%s input_tokens=%d output_tokens=%d total_tokens=%d bot=%s",
                     model_name, input_tokens, output_tokens, input_tokens + output_tokens,
+                    PUBLISHED_API_ID or "none",
                 )
                 yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': input_tokens, 'completion_tokens': output_tokens, 'total_tokens': input_tokens + output_tokens}})}\n\n"
 
@@ -263,7 +340,7 @@ async def stream_openai_response(
 
 
 # ---------------------------------------------------------------------------
-# Models list
+# GET /v1/models
 # ---------------------------------------------------------------------------
 @router.get("/models")
 def list_models(request: Request):
