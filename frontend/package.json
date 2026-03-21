@@ -78,6 +78,15 @@
       "xstate": "4.38.3"
     },
     "@aws-amplify/ui-react": {
+      "@aws-amplify/ui": {
+        "xstate": "4.38.3"
+      },
+      "xstate": "4.38.3"
+    },
+    "@aws-amplify/ui-react-core": {
+      "@aws-amplify/ui": {
+        "xstate": "4.38.3"
+      },
       "xstate": "4.38.3"
     }
   }
