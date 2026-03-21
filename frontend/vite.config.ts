@@ -1,54 +1,24 @@
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
-import path from 'path';
-import fs from 'fs';
 
-// Fix: @aws-amplify/ui and @xstate/react v3 (nested under @aws-amplify)
-// need xstate v4, but the top-level xstate is v5. Rollup resolves bare
-// 'xstate' imports to the hoisted v5 regardless of npm overrides.
-//
-// This plugin intercepts 'xstate' imports from @aws-amplify packages and
-// rewrites them to point at the nested v4 copy's ESM entry.
+// Fix: @aws-amplify packages need xstate v4, but the app uses xstate v5.
+// We install xstate v4 as "xstate-v4" (npm alias) and redirect @aws-amplify
+// imports to it. This avoids Rollup's module resolution issues entirely.
 function amplifyXstateFixPlugin(): Plugin {
-  let xstateV4Entry: string | null = null;
-
   return {
     name: 'amplify-xstate-fix',
     enforce: 'pre',
+    async resolveId(source, importer, options) {
+      if (source !== 'xstate' || !importer) return null;
 
-    configResolved() {
-      // Find the xstate v4 ESM entry — npm installs it under
-      // @aws-amplify/ui-react/node_modules/xstate (via overrides)
-      const candidates = [
-        'node_modules/@aws-amplify/ui-react/node_modules/xstate',
-        'node_modules/@aws-amplify/ui-react-core/node_modules/xstate',
-      ];
-      for (const candidate of candidates) {
-        const abs = path.resolve(candidate);
-        if (fs.existsSync(abs)) {
-          // xstate v4 has es/ directory with ESM build
-          const esEntry = path.join(abs, 'es', 'index.js');
-          const libEntry = path.join(abs, 'lib', 'index.js');
-          if (fs.existsSync(esEntry)) {
-            xstateV4Entry = esEntry;
-          } else if (fs.existsSync(libEntry)) {
-            xstateV4Entry = libEntry;
-          } else {
-            // Fallback: use package.json main/module field
-            xstateV4Entry = abs;
-          }
-          break;
-        }
-      }
-    },
-
-    resolveId(source, importer) {
-      if (source !== 'xstate' || !importer || !xstateV4Entry) return null;
-
-      // Redirect xstate imports from @aws-amplify packages to v4
-      if (importer.includes('@aws-amplify')) {
-        return xstateV4Entry;
+      // Redirect xstate imports from @aws-amplify packages to xstate-v4
+      if (importer.includes('@aws-amplify') || importer.includes('@xstate')) {
+        const result = await this.resolve('xstate-v4', importer, {
+          ...options,
+          skipSelf: true,
+        });
+        return result;
       }
       return null;
     },
@@ -117,6 +87,7 @@ export default defineConfig({
             src: '/images/bedrock_icon_512.png',
             sizes: '512x512',
             type: 'image/png',
+            purpose: 'maskable',
           },
           {
             src: '/images/bedrock_icon_512.png',
