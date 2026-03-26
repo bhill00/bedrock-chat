@@ -3,6 +3,7 @@ import { CfnOutput, Stack, StackProps } from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
 import { DockerImageCode, DockerImageFunction } from "aws-cdk-lib/aws-lambda";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as path from "path";
@@ -144,6 +145,43 @@ export class ApiPublishmentStack extends Stack {
     chatQueue.grantSendMessages(apiHandler);
     chatQueue.grantConsumeMessages(sqsConsumeHandler);
 
+    // Lambda authorizer — accepts API key from x-api-key OR Authorization: Bearer
+    const authorizerFn = new lambda.Function(this, "ApiKeyAuthorizer", {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "index.handler",
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../lambda/api-key-authorizer")
+      ),
+      timeout: cdk.Duration.seconds(10),
+      role: new iam.Role(this, "AuthorizerRole", {
+        assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+        managedPolicies: [
+          iam.ManagedPolicy.fromAwsManagedPolicyName(
+            "service-role/AWSLambdaBasicExecutionRole"
+          ),
+        ],
+        inlinePolicies: {
+          ReadApiKeys: new iam.PolicyDocument({
+            statements: [
+              new iam.PolicyStatement({
+                actions: ["apigateway:GET"],
+                resources: ["*"],
+              }),
+            ],
+          }),
+        },
+      }),
+    });
+
+    const authorizer = new apigateway.RequestAuthorizer(this, "Authorizer", {
+      handler: authorizerFn,
+      // Use context as a dummy identity source so API GW always invokes the Lambda
+      // regardless of which auth header is present. The Lambda inspects both
+      // x-api-key and Authorization: Bearer itself.
+      identitySources: [apigateway.IdentitySource.context("httpMethod")],
+      resultsCacheTtl: cdk.Duration.seconds(0), // no caching — key revocation is immediate
+    });
+
     const api = new apigateway.LambdaRestApi(this, "Api", {
       restApiName: id,
       handler: apiHandler,
@@ -151,7 +189,11 @@ export class ApiPublishmentStack extends Stack {
       deployOptions: {
         stageName: deploymentStage,
       },
-      defaultMethodOptions: { apiKeyRequired: true },
+      defaultMethodOptions: {
+        apiKeyRequired: false,
+        authorizer: authorizer,
+        authorizationType: apigateway.AuthorizationType.CUSTOM,
+      },
       defaultCorsPreflightOptions: props.corsOptions,
     });
 
